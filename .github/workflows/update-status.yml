@@ -16,7 +16,6 @@ on:
   repository_dispatch:
     types: [self-trigger] 
 
-    
 permissions:
   contents: write
   issues: write
@@ -28,12 +27,15 @@ jobs:
       - uses: actions/checkout@v3
 
       - uses: actions/setup-python@v4
+        if: steps.domain_check.outputs.abort == 'false'
         with:
           python-version: "3.11"
 
       - run: pip install -r requirements.txt
+        if: steps.domain_check.outputs.abort == 'false'
 
       - name: Generate config.json
+        if: steps.domain_check.outputs.abort == 'false'
         run: |
           mkdir -p status
           REPO="${{ github.repository }}"
@@ -50,7 +52,18 @@ jobs:
           echo "Generated status/config.json: "
           cat status/config.json
 
+      - name: Check if domains exist
+        id: domain_check
+        run: |
+          if [ ! -s domains.txt ]; then
+            echo "No domains found. Aborting gracefully."
+            echo "abort=true" >> $GITHUB_OUTPUT
+          else
+            echo "abort=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Check domains
+        if: steps.domain_check.outputs.abort == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -59,6 +72,7 @@ jobs:
         run: python check_domains.py
 
       - name: Commit files
+        if: steps.domain_check.outputs.abort == 'false'
         id: commit
         run: |
           git config user.name "github-actions[bot]"
@@ -81,6 +95,7 @@ jobs:
           git push
 
       - name: Trigger self via repository_dispatch
+        if: steps.domain_check.outputs.abort == 'false'
         uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

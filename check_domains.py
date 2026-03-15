@@ -130,12 +130,58 @@ def load_domain_history(domain):
     print(f"[load_domain_history] For {domain} | JSON file does not exist: {file}")
     return {"domain": domain, "history": []}
 
-def save_domain_history(domain, history):
+def save_domain_history(domain, new_entry, extra_fields):
     os.makedirs("status/history", exist_ok=True)
-    file = f"status/history/{sanitize_filename(domain)}.json"
-    with open(file, "w") as f:
-        json.dump(history, f, indent=2)
-    print(f"[save_domain_history] For {domain} | Saved JSON to {file}")
+    file_path = f"status/history/{sanitize_filename(domain)}.json"
+    
+    # 1. Load existing data
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            data = json.load(f)
+    else:
+        data = {"domain": domain, "history": [], **extra_fields}
+
+    # 2. Append new entry
+    data["history"].append(new_entry)
+    data.update(extra_fields)
+
+    # 3. Process Aggregation
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=7)
+    
+    detailed_history = []
+    to_aggregate = {} # date_string -> list of entries
+
+    for entry in data["history"]:
+        entry_time = datetime.strptime(entry["timestamp"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        
+        if entry_time > cutoff:
+            detailed_history.append(entry)
+        else:
+            # Group by date for averaging
+            date_str = entry_time.strftime("%Y-%m-%d")
+            if date_str not in to_aggregate:
+                to_aggregate[date_str] = []
+            to_aggregate[date_str].append(entry)
+
+    # 4. Create daily averages for old data
+    aggregated_history = []
+    for date_str, entries in to_aggregate.items():
+        avg_resp = sum(e["http_response_time_ms"] for e in entries if e["http_response_time_ms"]) / len(entries)
+        worst_status = max(e["http_status"] for e in entries if e["http_status"]) # Capture if it went down
+        
+        aggregated_history.append({
+            "timestamp": f"{date_str} 23:59:59",
+            "http_status": worst_status,
+            "http_response_time_ms": round(avg_resp, 2),
+            "is_averaged": True # Flag to distinguish from raw data
+        })
+
+    # 5. Combine and Sort
+    data["history"] = sorted(aggregated_history + detailed_history, key=lambda x: x["timestamp"])
+
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=2)
 
 def load_domain_xml(domain):
     file = f"status/history/{sanitize_filename(domain)}.xml"

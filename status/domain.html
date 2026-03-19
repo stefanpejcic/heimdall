@@ -29,9 +29,9 @@
                   <option value="3h">3h</option>
                   <option value="6h">6h</option>
                   <option value="12h">12h</option>
-                  <option value="24h" selected>24h</option>
+                  <option value="24h">24h</option>
                   <option value="2d">2d</option>
-                  <option value="7d">7d</option>
+                  <option value="7d" selected>7d</option>
                   <option value="14d">14d</option>
                   <option value="30d">30d</option>
                   <option value="3mo">3mo</option>
@@ -322,7 +322,7 @@
             loading: true,
             outages: 0,
             fullHistory: [],
-            selectedRange: "24h",
+            selectedRange: "7d",
             domain: '',
             safeDomain: '',
             history: [],
@@ -640,6 +640,6 @@ get uptimeDuration() {
     <!-- FOOTER -->
     <small class="mt-auto text-center p-5" x-show="domain">⚡ Subscribe via RSS — <a href="index.xml" target="_blank" class="no-underline">to all updates</a> or <a :href="`history/${safeDomain}.xml`" target="_blank" class="no-underline"> only this feed (<span x-text="domain"></span>)</a></small>
     <a href="https://github.com/stefanpejcic/heimdall/" target="_blank" class="fixed bottom-4 right-4 group"><span class="text-3xl relative">🗿</span><span class="absolute right-full top-1/2 -translate-y-1/2 mr-2 hidden group-hover:block bg-gray-800 text-white text-sm px-2 py-1 rounded-lg shadow-lg whitespace-nowrap">Status page generated with 🗿 Heimdall</span></a>
-
+  
 </body>
 </html>

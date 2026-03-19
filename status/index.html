@@ -254,7 +254,7 @@ function domainMonitor() {
     showHidden: false,
     origin: window.location.origin,
     get allUp() {
-      return this.domains.every(d => d.http_ok && d.whois_ok && d.ssl_ok);
+      return this.domains.every(d => d.http_ok && d.whois_ok); //&& d.ssl_ok
     },
     httpStatusInfo(status) {
       if (status < 200) {

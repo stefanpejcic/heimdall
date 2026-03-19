@@ -8,6 +8,7 @@ import json
 import xml.etree.ElementTree as ET
 import tldextract
 from urllib.parse import urlparse
+import dns.resolver
 import ipaddress
 
 cf_ranges_cache = None  # global cache for Cloudflare IPs
@@ -167,8 +168,18 @@ def save_domain_history(domain, new_entry, extra_fields):
     # 4. Create daily averages for old data
     aggregated_history = []
     for date_str, entries in to_aggregate.items():
-        avg_resp = sum(e["http_response_time_ms"] for e in entries if e["http_response_time_ms"]) / len(entries)
-        worst_status = max(e["http_status"] for e in entries if e["http_status"]) # Capture if it went down
+        # Response time
+        valid_times = [e["http_response_time_ms"] for e in entries if e["http_response_time_ms"] is not None]
+        avg_resp = sum(valid_times) / len(valid_times) if valid_times else None
+        
+        # Status
+        valid_statuses = [e["http_status"] for e in entries if e["http_status"] is not None]
+        
+        if valid_statuses:
+            worst_status = max(valid_statuses, key=lambda s: (s >= 500, s >= 400, s))
+        else:
+            worst_status = None
+
         
         aggregated_history.append({
             "timestamp": f"{date_str} 23:59:59",
@@ -213,7 +224,7 @@ def get_outgoing_ip():
 def main():
     token = os.getenv("GITHUB_TOKEN")
     repo_name = os.getenv("GITHUB_REPOSITORY")
-    days_threshold = int(os.getenv("DAYS_THRESHOLD", "29"))
+    days_threshold = int(os.getenv("DAYS_THRESHOLD", "9"))
     response_threshold = int(os.getenv("RESPONSE_THRESHOLD", "1000"))
     
     print("==============================================")
@@ -270,204 +281,215 @@ def main():
     # ---- domains.txt ----
     domains = list(dict.fromkeys(read_domains()))  # deduplicate 
     for domain in domains:
-        print(f"[PREPARATION] checking domain: {domain}")
-
-        # ---- preparation ----
-        hostname, port = get_hostname_port(domain)
-        url = f"https://{domain}" if "://" not in domain else domain
-
-        now = datetime.utcnow()
-        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        apex = get_apex_domain(domain)
-
-        # ---- Read existing JSON and read previous data ----
-        domain_history = load_domain_history(domain)
-        last_entry = domain_history["history"][-1] if domain_history["history"] else None
-        checked_in_last_24h = False
-        if last_entry and "timestamp" in last_entry:
-            timestamp = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-            previous_timestamp = datetime.strptime(last_entry["timestamp"], "%Y-%m-%d %H:%M:%S")
-            if timestamp - previous_timestamp < timedelta(hours=24):
-                checked_in_last_24h = True  
-
-        if not checked_in_last_24h:            # use data from previous check
-            exp_date, registrar = get_whois_info(apex)
-            nameservers = get_dns_nameservers(apex)
-            ssl_exp = get_ssl_expiration(hostname, port)
-        else:                                  # run whois check
-            exp_date = datetime.strptime(domain_history["whois_expiry"], "%Y-%m-%d") if domain_history.get("whois_expiry") else None
-            registrar = domain_history.get("registrar")
-            nameservers = domain_history.get("nameservers")
-            ssl_exp = datetime.strptime(domain_history["ssl_expiry"], "%Y-%m-%d") if domain_history.get("ssl_expiry") else None
-
-        # ---- WHOIS Expiration --- #
-        days_left = None
-        if exp_date:
-            if exp_date.tzinfo is not None:
-                exp_date = exp_date.astimezone(timezone.utc).replace(tzinfo=None)
-            days_left = (exp_date - now).days
-            issue = find_issue(f"Domain {domain} expires in")
-            if days_left <= days_threshold:
-                if not issue:
-                    create_issue(
-                        f"⚠️ Domain {domain} expires in {days_left} days!",
-                        f"**{domain}** will expire on {exp_date:%Y-%m-%d}.\nDays left: {days_left}"
-                    )
-                else:
-                    comment_on_issue(issue, f"@stefanpejcic Reminder: **{domain}** still expires in {days_left} days (on {exp_date:%Y-%m-%d}).")
-            else:
-                if issue:
-                    close_issue(issue, f"✅ Domain {domain} renewed (expires {exp_date:%Y-%m-%d}, {days_left} days left).")
-
-        # ---- WHOIS registrar --- #
-        previous_registrar = last_entry.get("registrar") if last_entry else None
-        if previous_registrar:
-            if registrar != previous_registrar:
-                issue = find_issue(f"Registar changed for domain: {domain}")
-                if not issue:
-                    create_issue(
-                        f"🚨 Registar changed for domain: {domain} to: {registrar}",
-                        f"**{domain}** register on last check was: {previous_registrar}.\nNew register information: {registrar}"
-                    )
-                else:
-                    comment_on_issue(issue, f"@stefanpejcic Reminder: **{domain}** register info was changed from: {previous_registrar} to: {registrar}\nCheck domain WHOIS information ASAP!")
-            # no else, this need to be manually closed! 
-
-        # ---- SSL Expiration ---- #
-        ssl_days = None
-        issue = find_issue(f"SSL for {domain}")
-        if ssl_exp:
-            ssl_days = (ssl_exp - now).days
-            if ssl_days <= days_threshold:
-                if not issue:
-                    create_issue(
-                        f"🔒 SSL for {domain} expires in {ssl_days} days!",
-                        f"SSL cert for **{domain}** expires on {ssl_exp:%Y-%m-%d}.\nDays left: {ssl_days}"
-                    )
-            else:
-                if issue:
-                    close_issue(issue, f"✅ SSL for {domain} renewed (expires {ssl_exp:%Y-%m-%d}, {ssl_days} days left).")
-
-        # ---- HTTP response time ----
-        status, resp_time = get_http_status(url, session)
-        resp_time_text = f"{resp_time:.0f} ms" if resp_time is not None else "N/A"
-
-        issue = find_issue(f"Slow response for {domain}")
-        if resp_time and resp_time > response_threshold:
-            if not issue:
-                create_issue(
-                    f"⚠️ Slow response for {domain}",
-                    f"HTTP response time is {resp_time_text} (threshold {response_threshold} ms)."
-                )
-        else:
-            if issue:
-                close_issue(issue, f"✅ {domain} is healthy again, response time {resp_time_text}).")
-
-        # ---- Status code ----
-        issue = find_issue(f"Status check failed for {domain}")
-        if status is None:
-            if not issue:
-                create_issue(
-                    f"❌ Status check failed for {domain} | URL: {url}",
-                    f"Latest HTTP response code: `{status}`"
-                )
-            else:
-                comment_on_issue(issue, f"Still no HTTP status code received.")
-        elif status >= 400:
-            if not issue:
-                create_issue(
-                    f"❌ Status check failed for {domain} | URL: {url}",
-                    f"Latest HTTP response code: `{status}`"
-                )
-        else:
-            if issue:
-                close_issue(issue, f"✅ {domain} is healthy again, status code: {status}).")
-
-
-        # ---- Check if NS changed ----
-        previous_ns = last_entry.get("nameservers") if last_entry else None
-        ip_issue = find_issue(f"Nameservers change detected for {domain}")
-        
-        if previous_ns and nameservers and previous_ns != nameservers:
-            if not ip_issue:
-                create_issue(
-                    f"🚨 Nameservers change detected for {domain} ({nameservers})",
-                    f"Domain **{domain}** NS changed from `{previous_ns}` to `{nameservers}`"
-                )
-            else:
-                comment_on_issue(ip_issue, f"NS updated to `{nameservers}`")
-                ip_issue.edit(title=f"🚨 Nameservers change detected for {domain} from `{previous_ns}` to `{nameservers}`")
-
-
-        # ---- Check if IPv4 changed ---- #
         try:
-            resolved_ip = socket.gethostbyname(hostname)
-        except Exception as e:
-            print(f"[DNS] Error resolving {hostname}: {e}")
-            resolved_ip = None
-
-        previous_ip = last_entry.get("resolved_ip") if last_entry else None
-
-        if resolved_ip and previous_ip and previous_ip != resolved_ip:
-            if is_ip_in_cloudflare_cached(resolved_ip):
-                print(f"[DNS] {hostname} resolves to Cloudflare IP {resolved_ip}, ignoring for IP change detection.")
-            elif is_ip_vercel(resolved_ip):
-                print(f"[DNS] {hostname} resolves to Vercel IP {resolved_ip}, ignoring for IP change detection.")            
+            print(f"[PREPARATION] checking domain: {domain}")
+    
+            # ---- preparation ----
+            hostname, port = get_hostname_port(domain)
+            url = f"https://{domain}" if "://" not in domain else domain
+    
+            now = datetime.utcnow()
+            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+            apex = get_apex_domain(domain)
+    
+            # ---- Read existing JSON and read previous data ----
+            domain_history = load_domain_history(domain)
+            last_entry = domain_history["history"][-1] if domain_history["history"] else None
+            checked_in_last_24h = False
+            if last_entry and "timestamp" in last_entry:
+                timestamp = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                previous_timestamp = datetime.strptime(last_entry["timestamp"], "%Y-%m-%d %H:%M:%S")
+                if timestamp - previous_timestamp < timedelta(hours=24):
+                    checked_in_last_24h = True  
+    
+            if not checked_in_last_24h:            # use data from previous check
+                exp_date, registrar = get_whois_info(apex)
+                nameservers = get_dns_nameservers(apex)
+                ssl_exp = get_ssl_expiration(hostname, port)
+            else:                                  # run whois check
+                exp_date = datetime.strptime(domain_history["whois_expiry"], "%Y-%m-%d") if domain_history.get("whois_expiry") else None
+                registrar = domain_history.get("registrar")
+                nameservers = domain_history.get("nameservers")
+                ssl_exp = datetime.strptime(domain_history["ssl_expiry"], "%Y-%m-%d") if domain_history.get("ssl_expiry") else None
+    
+            # ---- WHOIS Expiration --- #
+            days_left = None
+            if exp_date:
+                if exp_date.tzinfo is not None:
+                    exp_date = exp_date.astimezone(timezone.utc).replace(tzinfo=None)
+                days_left = (exp_date - now).days
+                issue = find_issue(f"Domain {domain} expires in")
+                if days_left <= days_threshold:
+                    if not issue:
+                        create_issue(
+                            f"⚠️ Domain {domain} expires in {days_left} days!",
+                            f"**{domain}** will expire on {exp_date:%Y-%m-%d}.\nDays left: {days_left}"
+                        )
+                    else:
+                        comment_on_issue(issue, f"@stefanpejcic Reminder: **{domain}** still expires in {days_left} days (on {exp_date:%Y-%m-%d}).")
+                else:
+                    if issue:
+                        close_issue(issue, f"✅ Domain {domain} renewed (expires {exp_date:%Y-%m-%d}, {days_left} days left).")
+    
+            # ---- WHOIS registrar --- #
+            previous_registrar = last_entry.get("registrar") if last_entry else None
+            if previous_registrar:
+                if registrar != previous_registrar:
+                    issue = find_issue(f"Registar changed for domain: {domain}")
+                    if not issue:
+                        create_issue(
+                            f"🚨 Registar changed for domain: {domain} to: {registrar}",
+                            f"**{domain}** register on last check was: {previous_registrar}.\nNew register information: {registrar}"
+                        )
+                    else:
+                        comment_on_issue(issue, f"@stefanpejcic Reminder: **{domain}** register info was changed from: {previous_registrar} to: {registrar}\nCheck domain WHOIS information ASAP!")
+                # no else, this need to be manually closed! 
+    
+            # ---- SSL Expiration ---- #
+            ssl_days = None
+            issue = find_issue(f"SSL for {domain}")
+            if ssl_exp:
+                ssl_days = (ssl_exp - now).days
+                if ssl_days <= days_threshold:
+                    if not issue:
+                        create_issue(
+                            f"🔒 SSL for {domain} expires in {ssl_days} days!",
+                            f"SSL cert for **{domain}** expires on {ssl_exp:%Y-%m-%d}.\nDays left: {ssl_days}"
+                        )
+                else:
+                    if issue:
+                        close_issue(issue, f"✅ SSL for {domain} renewed (expires {ssl_exp:%Y-%m-%d}, {ssl_days} days left).")
+    
+            # ---- HTTP response time ----
+            status, resp_time = get_http_status(url, session)
+            resp_time_text = f"{resp_time:.0f} ms" if resp_time is not None else "N/A"
+    
+            issue = find_issue(f"Slow response for {domain}")
+            if resp_time and resp_time > response_threshold:
+                if not issue:
+                    create_issue(
+                        f"⚠️ Slow response for {domain}",
+                        f"HTTP response time is {resp_time_text} (threshold {response_threshold} ms)."
+                    )
             else:
-                ip_issue = find_issue(f"IP change detected for {domain}")
+                if issue:
+                    close_issue(issue, f"✅ {domain} is healthy again, response time {resp_time_text}).")
+    
+            # ---- Status code ----
+            issue = find_issue(f"Status check failed for {domain}")
+            if status is None:
+                if not issue:
+                    create_issue(
+                        f"❌ Status check failed for {domain} | URL: {url}",
+                        f"Latest HTTP response code: `{status}`"
+                    )
+                else:
+                    comment_on_issue(issue, f"Still no HTTP status code received.")
+            elif status >= 400:
+                if not issue:
+                    create_issue(
+                        f"❌ Status check failed for {domain} | URL: {url}",
+                        f"Latest HTTP response code: `{status}`"
+                    )
+            else:
+                if issue:
+                    close_issue(issue, f"✅ {domain} is healthy again, status code: {status}).")
+    
+    
+            # ---- Check if NS changed ----
+            previous_ns = last_entry.get("nameservers") if last_entry else None
+            ip_issue = find_issue(f"Nameservers change detected for {domain}")
+            
+            if previous_ns and nameservers and previous_ns != nameservers:
                 if not ip_issue:
                     create_issue(
-                        f"🚨 IP change detected for {domain} ({resolved_ip})",
-                        f"Domain **{domain}** IP changed from `{previous_ip}` to `{resolved_ip}`"
+                        f"🚨 Nameservers change detected for {domain} ({nameservers})",
+                        f"Domain **{domain}** NS changed from `{previous_ns}` to `{nameservers}`"
                     )
                 else:
-                    comment_on_issue(ip_issue, f"IP updated to `{resolved_ip}`")
-                    ip_issue.edit(title=f"🚨 IP change detected for {domain} from `{previous_ip}` to `{resolved_ip}`")
+                    comment_on_issue(ip_issue, f"NS updated to `{nameservers}`")
+                    ip_issue.edit(title=f"🚨 Nameservers change detected for {domain} from `{previous_ns}` to `{nameservers}`")
+    
+    
+            # ---- Check if IPv4 changed ---- #
+            try:
+                resolved_ip = socket.gethostbyname(hostname)
+            except Exception as e:
+                print(f"[DNS] Error resolving {hostname}: {e}")
+                resolved_ip = None
+    
+            previous_ip = last_entry.get("resolved_ip") if last_entry else None
+    
+            if resolved_ip and previous_ip and previous_ip != resolved_ip:
+                if is_ip_in_cloudflare_cached(resolved_ip):
+                    print(f"[DNS] {hostname} resolves to Cloudflare IP {resolved_ip}, ignoring for IP change detection.")
+                elif is_ip_vercel(resolved_ip):
+                    print(f"[DNS] {hostname} resolves to Vercel IP {resolved_ip}, ignoring for IP change detection.")            
+                else:
+                    ip_issue = find_issue(f"IP change detected for {domain}")
+                    if not ip_issue:
+                        create_issue(
+                            f"🚨 IP change detected for {domain} ({resolved_ip})",
+                            f"Domain **{domain}** IP changed from `{previous_ip}` to `{resolved_ip}`"
+                        )
+                    else:
+                        comment_on_issue(ip_issue, f"IP updated to `{resolved_ip}`")
+                        ip_issue.edit(title=f"🚨 IP change detected for {domain} from `{previous_ip}` to `{resolved_ip}`")
+    
+            # ---- Checks completed for domain, saving.. ----
+            domain_entry = {
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(timestamp, datetime) else timestamp,
+                "whois_ok": days_left > days_threshold if days_left is not None else False,
+                "ssl_ok": ssl_days > days_threshold if ssl_days is not None else False,
+                "http_status": status,
+                "http_ok": status is not None and status < 400,
+                "http_response_time_ms": resp_time,
+                "resolved_ip": resolved_ip
+            }
+            
+            extra_fields = {
+                "ip_address": outgoing_ipv4,
+                "whois_expiry": exp_date.strftime("%Y-%m-%d") if exp_date else None,
+                "nameservers": nameservers if nameservers else None,
+                "registrar": registrar,
+                "ssl_expiry": ssl_exp.strftime("%Y-%m-%d") if ssl_exp else None
+            }
+    
+            # ---- Save JSON for domain --- #
+            save_domain_history(domain, domain_entry, extra_fields)
+    
+            # ---- Save XML for domain ----
+            tree, root = load_domain_xml(domain)
+            entry_xml = ET.SubElement(root, "entry")
+            
+            for key, value in domain_entry.items():
+                el = ET.SubElement(entry_xml, key)
+                el.text = str(value)
+            
+            extra_xml = ET.SubElement(root, "extra")
+            for key, value in extra_fields.items():
+                el = ET.SubElement(extra_xml, key)
+                el.text = str(value)
+            
+            save_domain_xml(domain, tree)
+            
+            combined_results["domains"].append({
+                "domain": domain,
+                "history_entry": domain_entry,
+                **extra_fields
+            })
 
-        # ---- Checks completed for domain, saving.. ----
-        domain_entry = {
-            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(timestamp, datetime) else timestamp,
-            "whois_ok": days_left > days_threshold if days_left is not None else False,
-            "ssl_ok": ssl_days > days_threshold if ssl_days is not None else False,
-            "http_status": status,
-            "http_ok": status is not None and status < 400,
-            "http_response_time_ms": resp_time,
-            "resolved_ip": resolved_ip
-        }
-        
-        extra_fields = {
-            "ip_address": outgoing_ipv4,
-            "whois_expiry": exp_date.strftime("%Y-%m-%d") if exp_date else None,
-            "nameservers": nameservers if nameservers else None,
-            "registrar": registrar,
-            "ssl_expiry": ssl_exp.strftime("%Y-%m-%d") if ssl_exp else None
-        }
-
-        # ---- Save JSON for domain --- #
-        domain_history["history"].append(domain_entry)
-        domain_history.update(extra_fields)
-        save_domain_history(domain, domain_history)
-
-        # ---- Save XML for domain ----
-        tree, root = load_domain_xml(domain)
-        entry_xml = ET.SubElement(root, "entry")
-        
-        for key, value in domain_entry.items():
-            el = ET.SubElement(entry_xml, key)
-            el.text = str(value)
-        
-        extra_xml = ET.SubElement(root, "extra")
-        for key, value in extra_fields.items():
-            el = ET.SubElement(extra_xml, key)
-            el.text = str(value)
-        
-        save_domain_xml(domain, tree)
-        
-        combined_results["domains"].append({
-            "domain": domain,
-            "history_entry": domain_entry,
-            **extra_fields
-        })
+        except Exception as e:
+            print(f"[ERROR] Domain {domain} failed: {e}")
+    
+            # check
+            combined_results["domains"].append({
+                "domain": domain,
+                "error": str(e),
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            })
+    
+            continue  # move to next domain
 
     # ---- Save combined data to status.json ----
     os.makedirs("status", exist_ok=True)

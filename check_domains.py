@@ -206,6 +206,9 @@ def main():
     repo_name = os.getenv("GITHUB_REPOSITORY")
     days_threshold = int(os.getenv("DAYS_THRESHOLD", "9"))
     response_threshold = int(os.getenv("RESPONSE_THRESHOLD", "1000"))
+    notify_user = os.getenv("GITHUB_REPOSITORY_OWNER", "")
+    mention = f"@{notify_user} " if notify_user else ""
+        
     
     print("==============================================")
     print("                Domain Monitor                ")
@@ -306,7 +309,7 @@ def main():
                             f"**{domain}** will expire on {exp_date:%Y-%m-%d}.\nDays left: {days_left}"
                         )
                     else:
-                        comment_on_issue(issue, f"@stefanpejcic Reminder: **{domain}** still expires in {days_left} days (on {exp_date:%Y-%m-%d}).")
+                        comment_on_issue(issue, f"{mention}Reminder: **{domain}** still expires in {days_left} days (on {exp_date:%Y-%m-%d}).")
                 else:
                     if issue:
                         close_issue(issue, f"✅ Domain {domain} renewed (expires {exp_date:%Y-%m-%d}, {days_left} days left).")
@@ -322,7 +325,7 @@ def main():
                             f"**{domain}** register on last check was: {previous_registrar}.\nNew register information: {registrar}"
                         )
                     else:
-                        comment_on_issue(issue, f"@stefanpejcic Reminder: **{domain}** register info was changed from: {previous_registrar} to: {registrar}\nCheck domain WHOIS information ASAP!")
+                        comment_on_issue(issue, f"{mention}Reminder: **{domain}** register info was changed from: {previous_registrar} to: {registrar}\nCheck domain WHOIS information ASAP!")
                 # no else, this need to be manually closed! 
     
             # ---- SSL Expiration ---- #

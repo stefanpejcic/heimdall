@@ -183,7 +183,7 @@ def save_domain_history(domain, new_entry, extra_fields):
         aggregated_history.append({
             "timestamp": f"{date_str} 23:59:59",
             "http_status": worst_status,
-            "http_response_time_ms": round(avg_resp, 2),
+            "http_response_time_ms": round(avg_resp, 2) if avg_resp is not None else None,
             "is_averaged": True # Flag to distinguish from raw data
         })
 
